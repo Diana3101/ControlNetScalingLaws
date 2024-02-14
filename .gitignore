@@ -13,7 +13,7 @@ validation_set-hard_corrupted/
 wandb
 tests_data/
 
-environment.yaml
+base_environment.yaml
 download_laion.py
 inference.py
 torch_check.py
