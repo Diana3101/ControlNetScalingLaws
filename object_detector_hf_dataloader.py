@@ -7,6 +7,7 @@ from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+import pdb
 
 from laion_dataloader import make_train_dataset
 
@@ -66,6 +67,7 @@ dataloader = DataLoader(train_dataset,
 for step, batch in tqdm(enumerate(dataloader)):
     batch_urls = batch[1]
     batch_tensors = batch[0]
+
     batch_tensors['pixel_values'] = batch_tensors['pixel_values'].to(device)
     batch_tensors['pixel_mask'] = batch_tensors['pixel_mask'].to(device)
 
