@@ -22,12 +22,14 @@ import os
 import random
 import shutil
 from pathlib import Path
+import sys
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"]=":16:8"
 
 import cv2
 import accelerate
 import numpy as np
+import pandas as pd
 import re
 import torch
 import torch.nn.functional as F
@@ -129,19 +131,33 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
+    def sort_by_number(file_name):
+        match = re.search(r'\d+', file_name)  # Find the first number in the file name
+        if match:
+            return int(match.group())  # Convert the matched number to an integer
+        else:
+            return float('inf')  # If no number found, place the file at the end of the list
+
+    if args.validation_big_test_set:
+        df_prompts = pd.read_csv('test_set/prompts.csv')
+        validation_prompts = list(df_prompts['text'])
+        validation_images = os.listdir('test_set/')
+        validation_images = [f"test_set/{file}" for file in validation_images if 'conditioning_image' in file]
+        validation_images = sorted(validation_images, key=sort_by_number)
     else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
+        if len(args.validation_image) == len(args.validation_prompt):
+            validation_images = args.validation_image
+            validation_prompts = args.validation_prompt
+        elif len(args.validation_image) == 1:
+            validation_images = args.validation_image * len(args.validation_prompt)
+            validation_prompts = args.validation_prompt
+        elif len(args.validation_prompt) == 1:
+            validation_images = args.validation_image
+            validation_prompts = args.validation_prompt * len(args.validation_image)
+        else:
+            raise ValueError(
+                "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
+            )
 
     val_types = args.type_corrupted_validation_images.split(',')
     # if '' not in val_types:
@@ -159,11 +175,12 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
         val_avg_l2_norm = []
 
-        for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
+        for idx_val, (validation_prompt, validation_image_init) in tqdm(enumerate(zip(validation_prompts, validation_images))):
             validation_image_original = Image.open(validation_image_init).convert("RGB")
 
-            validation_color = validation_image_init.replace('image', 'color')
-            validation_color = Image.open(validation_color).convert("RGB")
+            # if not args.validation_big_test_set:
+            #     validation_color = validation_image_init.replace('image', 'color')
+            #     validation_color = Image.open(validation_color).convert("RGB")
 
             validation_target = validation_image_init.replace('conditioning', 'target')
             validation_target = Image.open(validation_target).convert("RGB")
@@ -224,14 +241,16 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
 
             val_avg_l2_norm.append(avg_l2_norm)
 
-            image_logs.append(
-                {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
-                "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
-                "validation_image_blur": validation_image_blur, "target_color": validation_color,
-                # remove it is redundant
-                "target_image": validation_target}
-            )
-            image_logs_all.extend(image_logs)
+            if idx_val <= 5:
+                image_logs.append(
+                    {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
+                    "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
+                    "validation_image_blur": validation_image_blur, 
+                    # "target_color": validation_color,
+                    # remove it is redundant
+                    "target_image": validation_target}
+                )
+                image_logs_all.extend(image_logs)
 
         for tracker in accelerator.trackers:
             if tracker.name == "tensorboard":
@@ -257,7 +276,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                     images = log["images"]
                     validation_prompt = log["validation_prompt"]
                     validation_image = log["validation_image"]
-                    target_color = log["target_color"]
+                    # target_color = log["target_color"]
+                    target_image = log["target_image"]
                     validation_image_blur = log["validation_image_blur"]
                     last_image_edge = log["last_image_edge"]
                     last_image_edge_blur = log["last_image_edge_blur"]
@@ -268,11 +288,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                     # if val_type == '':
                     formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
                     formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
-                    formatted_images.append(wandb.Image(target_color, caption="Target colors"))
+                    # formatted_images.append(wandb.Image(target_color, caption="Target colors"))
+                    formatted_images.append(wandb.Image(target_image, caption="Target image"))
 
                     for image in images:
                         image = wandb.Image(image, caption=validation_prompt)
                         formatted_images.append(image)
+                
                 
                 wandb_logs.append({f"validation_{val_type}": formatted_images,
                             f"edge_metric_{val_type}/ODS": np.mean(val_avg_img_ods),
@@ -280,6 +302,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                             f"edge_metric_blur_{val_type}/ODS": np.mean(val_avg_img_ods_blur),
                             f"edge_metric_blur_{val_type}/AP": np.mean(val_avg_img_ap_blur),
                             f"color_metric_{val_type}/L2_norm": np.mean(val_avg_l2_norm)})
+                
 
                 if np.mean(val_avg_img_ods_blur) > 0.8 and args.wandb_alerts_counter == 0:
                     wandb.alert(
@@ -895,6 +918,11 @@ def parse_args(input_args=None):
         ),
     )
 
+    parser.add_argument(
+        "--validation_big_test_set",
+        action="store_true",
+    )
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1501,7 +1529,14 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and (global_step % args.validation_steps == 0 \
+                    
+                    # if args.validation_prompt is not None and (global_step % args.validation_steps == 0 \
+                    #                                         # add log_validation at first global step
+                    #                                         or global_step == 1 \
+                    #                                         # add log_validation at last global step
+                    #                                         or global_step == args.max_train_steps):
+                        
+                    if (global_step % args.validation_steps == 0 \
                                                             # add log_validation at first global step
                                                             or global_step == 1 \
                                                             # add log_validation at last global step
@@ -1529,8 +1564,10 @@ def main(args):
                             args,
                             accelerator,
                             weight_dtype,
-                            global_step,
-                        )
+                            global_step,)
+                            ### CUSTOM FOR NPT TESTS
+                            # if args.validation_prompt == ["", "", "", "", ""]:
+                            sys.exit()
 
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}

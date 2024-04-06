@@ -12,6 +12,7 @@ validation_set-slightly_corrupted/
 validation_set-hard_corrupted/
 wandb
 tests_data/
+test_set/
 
 base_environment.yaml
 download_laion.py
