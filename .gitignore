@@ -27,7 +27,6 @@ tests_data/
 test_set/
 
 base_environment.yaml
-controlnet-scalinglaws.yaml
 download_laion.py
 inference.py
 torch_check.py
