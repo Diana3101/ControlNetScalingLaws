@@ -11,12 +11,13 @@ from tqdm import tqdm
 from PIL import Image    
     
     
-def get_ods_ap(img_pred, img_true, step=0.01):
+def get_ods_ap(img_pred, img_true, is_uint8, step=0.01):
     '''
         Calculate the ODS(optimal dataset scale) and AP(average precision).
     '''
-    img_pred = img_pred / 255.0
-    img_true = img_true / 255.0
+    if is_uint8:
+        img_pred = img_pred / 255.0
+        img_true = img_true / 255.0
 
     thres = 0.0
     list_pred = []

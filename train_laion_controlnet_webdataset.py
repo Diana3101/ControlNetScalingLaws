@@ -28,6 +28,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"]=":16:8"
 import cv2
 import accelerate
 import numpy as np
+import pandas as pd
 import re
 import torch
 import torch.nn.functional as F
@@ -45,7 +46,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
-import datasets
+# import datasets
 
 import diffusers
 from diffusers import (
@@ -63,10 +64,9 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from metrics.get_metrics import get_edge_metric, get_color_metric
-from utils.add_color_condition import add_3_channel_color_condition
-from utils.augmentation import get_corrupted_image, get_erased_image_by_fraction
+from metrics.get_metrics_unbatched import get_edge_metrics, get_depth_metrics
 from utils.onecycle_scheduler import get_onecycle_schedule
+
 
 import warnings
 warnings.simplefilter(action='ignore')
@@ -86,8 +86,23 @@ torch.backends.cudnn.deterministic = True
 ### setted by default
 torch.backends.cudnn.benchmark = False
 
-datasets.config.DOWNLOADED_DATASETS_PATH = Path('/shared_drive/user-files/huggingface/datasets/downloads')
-datasets.config.HF_DATASETS_CACHE = Path('/shared_drive/user-files/huggingface/datasets/cache')
+
+def init_zoe_model(accelerator, weight_dtype):
+    # torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)
+    repo = "isl-org/ZoeDepth"
+    # Zoe_N
+    model_zoe_n = torch.hub.load(repo, "ZoeD_N", pretrained=True)
+
+    model_zoe_n=model_zoe_n.to(accelerator.device)
+    model_zoe_n.core= model_zoe_n.core.to(weight_dtype)
+    model_zoe_n.conv2 = model_zoe_n.conv2.to(weight_dtype)
+    model_zoe_n.seed_bin_regressor = model_zoe_n.seed_bin_regressor.to(weight_dtype)
+    model_zoe_n.seed_projector =model_zoe_n.seed_projector.to(weight_dtype)
+    model_zoe_n.projectors= model_zoe_n.projectors.to(weight_dtype)
+    model_zoe_n.attractors=model_zoe_n.attractors.to(weight_dtype)
+    model_zoe_n.conditional_log_binomial=model_zoe_n.conditional_log_binomial.to(weight_dtype)
+
+    return model_zoe_n
 
 
 def image_grid(imgs, rows, cols):
@@ -101,7 +116,7 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
+def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, zoe_depth_model):
     logger.info("Running validation... ")
 
     controlnet = accelerator.unwrap_model(controlnet)
@@ -129,135 +144,102 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
+    def sort_by_number(file_name):
+        match = re.search(r'\d+', file_name)  # Find the first number in the file name
+        if match:
+            return int(match.group())  # Convert the matched number to an integer
+        else:
+            return float('inf')  # If no number found, place the file at the end of the list
+
+    if args.validation_set_folder:
+        df_prompts = pd.read_csv(f'{args.validation_set_folder}/prompts.csv')
+        validation_prompts = list(df_prompts['text'])
+        validation_images = os.listdir(f'{args.validation_set_folder}/')
+        validation_images = [f"{args.validation_set_folder}/{file}" for file in validation_images if 'conditioning_image' in file]
+        validation_images = sorted(validation_images, key=sort_by_number)
     else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
+        if len(args.validation_image) == len(args.validation_prompt):
+            validation_images = args.validation_image
+            validation_prompts = args.validation_prompt
+        elif len(args.validation_image) == 1:
+            validation_images = args.validation_image * len(args.validation_prompt)
+            validation_prompts = args.validation_prompt
+        elif len(args.validation_prompt) == 1:
+            validation_images = args.validation_image
+            validation_prompts = args.validation_prompt * len(args.validation_image)
+        else:
+            raise ValueError(
+                "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
+            )
 
-    val_types = args.type_corrupted_validation_images.split(',')
-    # if '' not in val_types:
-    #     val_types = [''] + val_types
-
-    image_logs_all = []
-    wandb_logs = []
     
-    for val_type in val_types:
-        val_type = val_type.strip()
-        if val_type != '':
-            val_type += '_corrupted'
+    wandb_logs = []
+    image_logs = []
 
-        image_logs = []
+    if args.condition_type == 'canny':
         val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
-        val_avg_l2_norm = []
+    elif args.condition_type == 'depth':
+        val_avg_metrics_dict = dict(a1=[], a2=[], a3=[], abs_rel=[], 
+                                    rmse=[], log_10=[], rmse_log=[], silog=[], sq_rel=[])
 
-        for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
-            validation_image_original = Image.open(validation_image_init).convert("RGB")
+    for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
+        validation_image = Image.open(validation_image_init).convert("RGB")
 
-            validation_color = validation_image_init.replace('image', 'color')
-            validation_color = Image.open(validation_color).convert("RGB")
-
-            validation_target = validation_image_init.replace('conditioning', 'target')
-            validation_target = Image.open(validation_target).convert("RGB")
-
-            if val_type != '':
-                folder, file = validation_image_init.split('/')[-2:]
-                validation_image_init = folder + f'-{val_type}/' + file
-                if not os.path.exists(validation_image_init):
-                    raise ValueError(
-                    f"{validation_image_init} path doesn't exist. Check `args.type_corrupted_validation_images` or path."
-        )
-
-            if args.condition_image_channels == 1:
-                validation_image = Image.open(validation_image_init).convert("L")
-            elif args.condition_image_channels == 3:
-                validation_image = Image.open(validation_image_init).convert("RGB")
+        validation_target = validation_image_init.replace('conditioning', 'target')
+        validation_target = Image.open(validation_target).convert("RGB")
                 
-            images = []
-            ### add color condition
-            if args.add_color_condition:
-                validation_image_tensor = transforms.functional.pil_to_tensor(validation_image)
-                validation_color_tensor = transforms.functional.pil_to_tensor(validation_color)
-                
-                if args.color_condition_stack_first:
-                    validation_image_color_tensor = torch.vstack((validation_color_tensor, validation_image_tensor))
-                else:
-                    # [6, 512, 512]
-                    validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
-                
-                # [1, 6, 512, 512]
-                validation_image_color_tensor = torch.unsqueeze(validation_image_color_tensor, 0)
+        images = []
 
-            if args.add_color_condition:
-                validation_image_for_pipeline = validation_image_color_tensor
-            else:
-                validation_image_for_pipeline = validation_image
+        for _ in range(args.num_validation_images):
+            with torch.autocast("cuda"):
+                image = pipeline(
+                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
+                ).images[0]
 
-            for _ in range(args.num_validation_images):
-                with torch.autocast("cuda"):
-                    image = pipeline(
-                        validation_prompt, validation_image_for_pipeline, num_inference_steps=20, generator=generator
-                    ).images[0]
+            images.append(image)
 
-                images.append(image)
-
+        if args.condition_type == 'canny':
             avg_img_ods, avg_img_ap, \
             avg_img_ods_blur, avg_img_ap_blur, \
-            last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metric(pred_images=images, 
-                                                                                        condition_img=validation_image_original)
-
-            avg_l2_norm = get_color_metric(pred_images=images, 
-                                            target_img=validation_target)
+            last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metrics(pred_images=images, 
+                                                                                            condition_img=validation_image)
 
             val_avg_img_ods.append(avg_img_ods)
             val_avg_img_ap.append(avg_img_ap)
             val_avg_img_ods_blur.append(avg_img_ods_blur)
             val_avg_img_ap_blur.append(avg_img_ap_blur)
-
-            val_avg_l2_norm.append(avg_l2_norm)
+    
 
             image_logs.append(
                 {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
                 "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
-                "validation_image_blur": validation_image_blur, "target_color": validation_color,
-                # remove it is redundant
+                "validation_image_blur": validation_image_blur,
                 "target_image": validation_target}
             )
-            image_logs_all.extend(image_logs)
 
-        for tracker in accelerator.trackers:
-            if tracker.name == "tensorboard":
-                for log in image_logs:
-                    images = log["images"]
-                    validation_prompt = log["validation_prompt"]
-                    validation_image = log["validation_image"]
+        elif args.condition_type == 'depth':
+            avg_metrics_dict, pred_depth_image = get_depth_metrics(pred_images=images, 
+                                                                    condition_img=validation_target, 
+                                                                    zoe_depth_model=zoe_depth_model,
+                                                                    weight_dtype=weight_dtype)
+            for key, value in avg_metrics_dict.items():
+                val_avg_metrics_dict[key].append(value)
 
-                    formatted_images = []
+            image_logs.append(
+                {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
+                "last_image_depth_map": pred_depth_image, "target_image": validation_target}
+            )
 
-                    formatted_images.append(np.asarray(validation_image))
-
-                    for image in images:
-                        formatted_images.append(np.asarray(image))
-
-                    formatted_images = np.stack(formatted_images)
-
-                    tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-            elif tracker.name == "wandb":
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            if args.condition_type == 'canny':
                 formatted_images = []
 
                 for log in image_logs:
                     images = log["images"]
                     validation_prompt = log["validation_prompt"]
                     validation_image = log["validation_image"]
-                    target_color = log["target_color"]
+                    target_image = log["target_image"]
                     validation_image_blur = log["validation_image_blur"]
                     last_image_edge = log["last_image_edge"]
                     last_image_edge_blur = log["last_image_edge_blur"]
@@ -265,32 +247,55 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                     formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
                     formatted_images.append(wandb.Image(last_image_edge, caption="Prediction image: Canny edge"))
 
-                    # if val_type == '':
+                        
                     formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
                     formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
-                    formatted_images.append(wandb.Image(target_color, caption="Target colors"))
+                    formatted_images.append(wandb.Image(target_image, caption="Target"))
 
                     for image in images:
                         image = wandb.Image(image, caption=validation_prompt)
                         formatted_images.append(image)
-                
-                wandb_logs.append({f"validation_{val_type}": formatted_images,
-                            f"edge_metric_{val_type}/ODS": np.mean(val_avg_img_ods),
-                            f"edge_metric_{val_type}/AP": np.mean(val_avg_img_ap),
-                            f"edge_metric_blur_{val_type}/ODS": np.mean(val_avg_img_ods_blur),
-                            f"edge_metric_blur_{val_type}/AP": np.mean(val_avg_img_ap_blur),
-                            f"color_metric_{val_type}/L2_norm": np.mean(val_avg_l2_norm)})
+                    
+                wandb_logs.append({f"validation": formatted_images,
+                            f"edge_metric/ODS": np.mean(val_avg_img_ods),
+                            f"edge_metric/AP": np.mean(val_avg_img_ap),
+                            f"edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
+                            f"edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
 
-                if np.mean(val_avg_img_ods_blur) > 0.8 and args.wandb_alerts_counter == 0:
-                    wandb.alert(
-                                    title="Sudden converge!",
-                                    text=f"edge_metric_blur_{val_type}/ODS: {np.mean(val_avg_img_ods_blur)}",
-                                    level=AlertLevel.WARN,
-                                )
-                    args.wandb_alerts_counter += 1
+                # if np.mean(val_avg_img_ods_blur) > 0.8 and args.wandb_alerts_counter == 0:
+                #     wandb.alert(
+                #                     title="Sudden converge!",
+                #                     text=f"edge_metric_blur/ODS: {np.mean(val_avg_img_ods_blur)}",
+                #                     level=AlertLevel.WARN,
+                #                 )
+                #     args.wandb_alerts_counter += 1
 
-            else:
-                logger.warn(f"image logging not implemented for {tracker.name}")
+            elif args.condition_type == 'depth':
+                formatted_images = []
+
+                for log in image_logs:
+                    images = log["images"]
+                    validation_prompt = log["validation_prompt"]
+                    validation_image = log["validation_image"]
+                    last_image_depth_map = log["last_image_depth_map"]
+                    target_image = log["target_image"]
+
+                    formatted_images.append(wandb.Image(validation_image, caption="Target depth map: ControlNet conditioning"))
+                    formatted_images.append(wandb.Image(last_image_depth_map, caption="Predicted depth map"))
+                    formatted_images.append(wandb.Image(target_image, caption="Target"))
+
+                    for image in images:
+                        image = wandb.Image(image, caption=validation_prompt)
+                        formatted_images.append(image)
+
+                wandb_logs_dict_to_append = {f"validation": formatted_images}
+                for key, metrics_list in val_avg_metrics_dict.items():
+                    wandb_logs_dict_to_append[f"depth_metric/{key}"] = np.mean(metrics_list)
+
+                wandb_logs.append(wandb_logs_dict_to_append)
+
+        else:
+            logger.warn(f"image logging not implemented for {tracker.name}")
 
     if tracker.name == "wandb":
         wandb_logs = {key: value for d in wandb_logs for key, value in d.items()}
@@ -298,160 +303,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     else:
         print('Saving of several types of validation images (corruptions) implemented only for wandb tracker!')
    
-    return image_logs_all
-
-def get_corruption_limit_by_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
-    logger.info("Running validation... ")
-
-    controlnet = accelerator.unwrap_model(controlnet)
-
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        controlnet=controlnet,
-        safety_checker=None,
-        revision=args.revision,
-        torch_dtype=weight_dtype,
-    )
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
-
-    image_logs_all = []
-    
-    for part_to_erase in np.arange(0.0, 1.0, 0.1):
-        image_logs = []
-        val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
-
-        for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
-            validation_image_original = Image.open(validation_image_init).convert("RGB")
-            validation_color = validation_image_init.replace('image', 'color')
-            validation_color = Image.open(validation_color).convert("RGB")
-
-            if args.condition_image_channels == 1:
-                validation_image = Image.open(validation_image_init).convert("L")
-            elif args.condition_image_channels == 3:
-                validation_image = Image.open(validation_image_init).convert("RGB")
-            
-            ### code to corrupt validation_image
-            conditioning_image_transforms = transforms.Compose(
-                [
-                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-                    transforms.CenterCrop(args.resolution),
-                    transforms.ToTensor(),
-                ]
-            )
-            validation_image_tensor = conditioning_image_transforms(validation_image)
-            validation_image_tensor_corrupted = get_erased_image_by_fraction(image=validation_image_tensor,
-                                                                             part_to_erase=part_to_erase)
-            validation_image = tvf.to_pil_image(validation_image_tensor_corrupted)
-            ### 
-                
-            images = []
-            ### add color condition
-            if args.add_color_condition:
-                validation_image_tensor = transforms.functional.pil_to_tensor(validation_image)
-                validation_color_tensor = transforms.functional.pil_to_tensor(validation_color)
-                
-                if args.color_condition_stack_first:
-                    validation_image_color_tensor = torch.vstack((validation_color_tensor, validation_image_tensor))
-                else:
-                    # [6, 512, 512]
-                    validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
-                
-                # [1, 6, 512, 512]
-                validation_image_color_tensor = torch.unsqueeze(validation_image_color_tensor, 0)
-
-            if args.add_color_condition:
-                validation_image_for_pipeline = validation_image_color_tensor
-            else:
-                validation_image_for_pipeline = validation_image
-
-            for _ in range(args.num_validation_images):
-                with torch.autocast("cuda"):
-                    image = pipeline(
-                        validation_prompt, validation_image_for_pipeline, num_inference_steps=20, generator=generator
-                    ).images[0]
-
-                images.append(image)
-
-            avg_img_ods, avg_img_ap, \
-            avg_img_ods_blur, avg_img_ap_blur, \
-            last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metric(pred_images=images, 
-                                                                                        condition_img=validation_image_original)
-
-            val_avg_img_ods.append(avg_img_ods)
-            val_avg_img_ap.append(avg_img_ap)
-            val_avg_img_ods_blur.append(avg_img_ods_blur)
-            val_avg_img_ap_blur.append(avg_img_ap_blur)
-
-            image_logs.append(
-                {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
-                "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
-                "validation_image_blur": validation_image_blur, "target_color": validation_color}
-            )
-            image_logs_all.extend(image_logs)
-
-        for tracker in accelerator.trackers:
-            if tracker.name == "wandb":
-                formatted_images = []
-
-                for log in image_logs:
-                    images = log["images"]
-                    validation_prompt = log["validation_prompt"]
-                    validation_image = log["validation_image"]
-                    target_color = log["target_color"]
-                    validation_image_blur = log["validation_image_blur"]
-                    last_image_edge = log["last_image_edge"]
-                    last_image_edge_blur = log["last_image_edge_blur"]
-
-                    formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
-                    formatted_images.append(wandb.Image(last_image_edge, caption="Prediction image: Canny edge"))
-                    formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
-                    formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
-                    formatted_images.append(wandb.Image(target_color, caption="Target colors"))
-
-                    for image in images:
-                        image = wandb.Image(image, caption=validation_prompt)
-                        formatted_images.append(image)
-                
-                tracker.log({f"validation_": formatted_images,
-                            f"edge_metric_/ODS": np.mean(val_avg_img_ods),
-                            f"edge_metric_/AP": np.mean(val_avg_img_ap),
-                            f"edge_metric_blur_/ODS": np.mean(val_avg_img_ods_blur),
-                            f"edge_metric_blur_/AP": np.mean(val_avg_img_ap_blur)},
-                            step=1000+int(part_to_erase*100))
-
-            else:
-                logger.warn(f"image logging not implemented for {tracker.name}")
-   
-    return image_logs_all
+    return image_logs
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -735,16 +587,6 @@ def parse_args(input_args=None):
         help="The config of the Dataset, leave as None if there's only one config.",
     )
     parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
     )
     parser.add_argument(
@@ -823,69 +665,7 @@ def parse_args(input_args=None):
         ),
     )
 
-    # Additional custom arguments
-    parser.add_argument(
-        "--add_color_condition",
-        action="store_true",
-        help="Adding color channels to the original conditioning image.",
-    )
-
-    parser.add_argument(
-        "--condition_image_channels",
-        type=int,
-        default=3,
-        help="Channels of condition black&white image (can be 3 - RGB image or 1 - Grayscale image).",
-    )
-
-    parser.add_argument(
-        "--color_condition_stack_first",
-        action="store_true",
-        help="How to stack color condition to original condition: before or after original condition vector.",
-    )
-
-    parser.add_argument(
-        "--corrupt_train_condition_images",
-        type=str,
-        default='',
-        help="How to corrupt training conditining images. 3 possible options: ['', 'slightly', 'hard'].",
-    )
-
-    parser.add_argument(
-        "--type_corrupted_validation_images",
-        type=str,
-        default='',
-        help="""Which type of corrupted conditining images to validate. 
-                Use a list with 3 possible options: '', 'slightly', 'hard', 'slightly, hard'.
-                For this should exist separate folders:
-                like: original validation - 'validation_set', 
-                slightly corrupted validation - 'validation_set-slightly_corrupted',
-                where names of the files with condition images are the same in both folders.""",
-    )
-
-    parser.add_argument(
-        "--part_of_training_set",
-        type=float,
-        default=1.0,
-        help=(
-            "Size of training dataset as a part of full dataset."
-        ),
-    )
-
-    parser.add_argument(
-        "--prob_corruption",
-        type=float,
-        default=1.0,
-        help=(
-            "Probability of applying corruption to the train dataset."
-        ),
-    )
-
-    parser.add_argument(
-        "--step_by_step_corruption",
-        action="store_true",
-        help="",
-    )
-
+    ### Additional custom arguments
     parser.add_argument(
         "--wandb_alerts_counter",
         type=int,
@@ -895,17 +675,53 @@ def parse_args(input_args=None):
         ),
     )
 
+    parser.add_argument(
+        "--train_data_path",
+        type=str,
+        default=None,
+        help=(
+            """Path to .csv file, with names of pathes to .tar files with original images + depth maps + captions in column 'path'."""
+        ),
+    )
+
+    parser.add_argument(
+        "--validation_set_folder",
+        type=str,
+        default=None
+    )
+
+    parser.add_argument(
+        "--condition_type",
+        type=str,
+        default=None,
+        help=(
+            "Type of condition images. Possible values: 'canny' or 'depth'."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_length",
+        type=int,
+        default=None,
+        help=(
+            "Length of the dataset, if you use iterable dataset."
+        ),
+    )
+    parser.add_argument(
+        "--download_dataset_before_streaming",
+        action="store_true"
+    )
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
 
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
+    if args.dataset_name is None and args.train_data_path is None:
+        raise ValueError("Specify either `--dataset_name` or `--train_data_path`")
 
-    if args.dataset_name is not None and args.train_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--train_data_dir`")
+    if args.dataset_name is not None and args.train_data_path is not None:
+        raise ValueError("Specify only one of `--dataset_name` or `--train_data_path`")
 
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
@@ -935,172 +751,112 @@ def parse_args(input_args=None):
 
     return args
 
-def make_train_dataset(args, tokenizer, accelerator):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
+def make_train_dataset(args, tokenizer):
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        if args.train_data_dir is not None:
+        if args.download_dataset_before_streaming:
             dataset = load_dataset(
-                args.train_data_dir,
-                cache_dir=args.cache_dir,
-            )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        logger.info(f"image column defaulting to {image_column}")
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.caption_column is None:
-        caption_column = column_names[1]
-        logger.info(f"caption column defaulting to {caption_column}")
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < args.proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    conditioning_image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        if args.condition_image_channels == 1:
-            conditioning_images = [image.convert("L") for image in examples[conditioning_image_column]]
-        elif args.condition_image_channels == 3:
-            conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-
-        ### add color condition
-        if args.add_color_condition:
-            conditioning_colors = []
-
-            for i in range(len(conditioning_images)):
-                conditioning_color = add_3_channel_color_condition(cond_image=conditioning_images[i], 
-                                                                target_image=images[i])
-                conditioning_colors.append(conditioning_color)
-
-
-        images = [image_transforms(image) for image in images]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
-        if args.corrupt_train_condition_images:
-            idxs_to_corrupt = random.sample(list(range(len(conditioning_images))), 
-                                                        int(len(conditioning_images)*args.prob_corruption))
+                args.dataset_name,
+                split="train",
+                num_proc=args.dataloader_num_workers,
+                cache_dir=args.cache_dir)
             
-            conditioning_images = [get_corrupted_image(image, mode=args.corrupt_train_condition_images) \
-                                   if idx in idxs_to_corrupt \
-                                   else image \
-                                   for idx, image in enumerate(conditioning_images)]
+            iterable_dataset = dataset.to_iterable_dataset()
 
-        if args.add_color_condition:
-            conditioning_colors = [conditioning_image_transforms(conditioning_color) for conditioning_color in conditioning_colors]
-
-            conditioning_color_images = []
-            for i in range(len(conditioning_images)):
-                if args.color_condition_stack_first:
-                    conditioning_color_image = torch.vstack((conditioning_colors[i], conditioning_images[i]))
-                else:
-                    conditioning_color_image = torch.vstack((conditioning_images[i], conditioning_colors[i]))
-                
-                conditioning_color_images.append(conditioning_color_image)
-
-        examples["pixel_values"] = images
-        if args.add_color_condition:
-            examples["conditioning_pixel_values"] = conditioning_color_images
         else:
-            examples["conditioning_pixel_values"] = conditioning_images
-        examples["input_ids"] = tokenize_captions(examples)
+            iterable_dataset = load_dataset(
+                args.dataset_name,
+                split="train",
+                streaming=True
+            )
+    else:
+        if args.train_data_path is not None:
+            df = pd.read_csv(args.train_data_path)
+            tar_subset_files = list(df['path'])
+            
+            iterable_dataset = load_dataset("webdataset", data_files={"train": tar_subset_files}, 
+                                            split="train", 
+                                            streaming=True)
 
-        return examples
 
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+    def get_transformed_image_and_captions(example):
+        new_example = {}
+        
+        caption = example['json']['caption']
+        key = example['__key__']
+        url = example['__url__']
+        image = example['image.jpg']
 
-    return train_dataset
+        if args.condition_type == 'depth':
+            conditioning_image = example['depth_image.jpg']
 
+        elif args.condition_type == 'canny':
+            conditioning_image = np.array(image.convert("L"))
+            conditioning_image = cv2.Canny(conditioning_image, 100, 200)
+            conditioning_image = Image.fromarray(conditioning_image)
 
-def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        image = image.convert("RGB")
+        conditioning_image = conditioning_image.convert("RGB")
 
-    conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+        def tokenize_captions(captions):
+            inputs = tokenizer(
+                    captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            )
+            return inputs.input_ids
+        
+        if not caption:
+            caption = ""
 
-    input_ids = torch.stack([example["input_ids"] for example in examples])
+        input_ids = tokenize_captions(caption)
 
-    return {
-        "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning_pixel_values,
-        "input_ids": input_ids,
-    }
+        image_transforms = transforms.Compose(
+                [
+                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                    transforms.CenterCrop(args.resolution),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5], [0.5]),
+                ]
+            )
+
+        condition_image_transforms = transforms.Compose(
+                [
+                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                    transforms.CenterCrop(args.resolution),
+                    transforms.ToTensor(),
+                ]
+            )
+
+        new_example['pixel_values'] = image_transforms(image)
+        new_example['conditioning_pixel_values'] = condition_image_transforms(conditioning_image)
+        new_example['input_ids'] = input_ids
+        new_example['key'] = torch.tensor(int(key))
+        new_example['url'] = url
+        
+        return new_example
+    
+
+    iterable_dataset = iterable_dataset.map(get_transformed_image_and_captions)
+    return iterable_dataset
+
+def collate_fn(train_dataset):
+    pixel_values = []
+    conditioning_pixel_values = []
+    input_ids = []
+    keys = []
+    
+    for example in train_dataset:
+        pixel_values.append(example["pixel_values"])
+        conditioning_pixel_values.append(example["conditioning_pixel_values"])
+        input_ids.append(example["input_ids"])
+        keys.append(example["key"])
+       
+
+    keys = torch.stack(keys)
+    pixel_values = torch.stack(pixel_values)
+    conditioning_pixel_values = torch.stack(conditioning_pixel_values)
+    input_ids = torch.stack(input_ids)
+
+    return keys, pixel_values, conditioning_pixel_values, input_ids
 
 
 def main(args):
@@ -1167,17 +923,13 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
-    if args.add_color_condition:
-        conditioning_channels = args.condition_image_channels + 3
-    else:
-        conditioning_channels = 3
-
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
         controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet, conditioning_channels=conditioning_channels)
+        controlnet = ControlNetModel.from_unet(unet, conditioning_channels=3)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1276,25 +1028,18 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = make_train_dataset(args, tokenizer, accelerator)
+    train_image_dataset = make_train_dataset(args, tokenizer=tokenizer)
+    train_image_dataset = train_image_dataset.with_format("torch")
 
-    if args.part_of_training_set < 1:
-        train_set_size = int(len(train_dataset) * args.part_of_training_set)
-        subset_idxs = list(range(train_set_size))
-
-        train_dataset = torch.utils.data.Subset(train_dataset, subset_idxs)
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
-
+    train_image_dataloader = torch.utils.data.DataLoader(train_image_dataset, 
+                                        batch_size=args.train_batch_size, 
+                                        num_workers=args.dataloader_num_workers,
+                                        collate_fn=collate_fn,
+                                        pin_memory=True)
+    
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil((args.dataset_length/args.train_batch_size) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -1314,8 +1059,8 @@ def main(args):
         )
 
     # Prepare everything with our `accelerator`.
-    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, optimizer, train_dataloader, lr_scheduler
+    controlnet, optimizer, train_image_dataloader, lr_scheduler = accelerator.prepare(
+        controlnet, optimizer, train_image_dataloader, lr_scheduler
     )
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -1326,13 +1071,18 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    if args.condition_type == 'depth':
+        zoe_depth_model = init_zoe_model(accelerator=accelerator, weight_dtype=weight_dtype)
+    else:
+        zoe_depth_model = None
+
     # Move vae, unet and text_encoder to device and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil((args.dataset_length/args.train_batch_size) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -1353,8 +1103,8 @@ def main(args):
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num examples = {(args.dataset_length/args.train_batch_size)*args.train_batch_size}")
+    logger.info(f"  Num batches each epoch = {args.dataset_length/args.train_batch_size}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -1366,7 +1116,7 @@ def main(args):
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            path = args.resume_from_checkpoint
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
@@ -1382,13 +1132,29 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
+
+            accelerator.load_state(path)
+            global_step = int(path.split("-")[-1])
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
     else:
         initial_global_step = 0
+
+    if args.controlnet_model_name_or_path:
+        if 'checkpoint' in args.controlnet_model_name_or_path:
+            path = args.controlnet_model_name_or_path
+            splitted_path = path.split('/')
+
+            if 'checkpoint' in splitted_path[-3]:
+                global_step = int(splitted_path[-3].split("-")[1])
+            elif 'checkpoint' in splitted_path[-2]:
+                global_step = int(splitted_path[-2].split("-")[1])
+            else:
+                logger.warn(f'Unrecognized checkpoint folder in {args.controlnet_model_name_or_path} path!')
+
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -1400,10 +1166,27 @@ def main(args):
 
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(train_image_dataloader):
+            key, pixel_values, conditioning_pixel_values, input_ids = batch
+                
+            pixel_values = pixel_values.to(dtype=weight_dtype, non_blocking=True)
+            input_ids = input_ids.to(non_blocking=True)
+            conditioning_pixel_values = conditioning_pixel_values.to(dtype=weight_dtype, non_blocking=True)
+
+            # im = transforms.functional.to_pil_image(pixel_values[23].to(dtype=torch.float32))
+            # im.save('im.jpg')
+            # im = transforms.functional.to_pil_image(conditioning_pixel_values[23].to(dtype=torch.float32))
+            # im.save('depth_im.jpg')
+
+            # im = transforms.functional.to_pil_image(pixel_values[25].to(dtype=torch.float32))
+            # im.save('im.jpg')
+            # im = transforms.functional.to_pil_image(conditioning_pixel_values[25].to(dtype=torch.float32))
+            # im.save('canny_im.jpg')
+            # import pdb; pdb.set_trace()
+
             with accelerator.accumulate(controlnet):
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -1418,9 +1201,9 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(input_ids)[0]
 
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                controlnet_image = conditioning_pixel_values
 
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
@@ -1501,36 +1284,25 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and (global_step % args.validation_steps == 0 \
-                                                            # add log_validation at first global step
-                                                            or global_step == 1 \
-                                                            # add log_validation at last global step
-                                                            or global_step == args.max_train_steps):
                         
-                        if args.step_by_step_corruption:
-                            image_logs = get_corruption_limit_by_validation(
-                                vae,
-                                text_encoder,
-                                tokenizer,
-                                unet,
-                                controlnet,
-                                args,
-                                accelerator,
-                                weight_dtype,
-                                global_step,
-                            )
-                        else:
-                            image_logs = log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            unet,
-                            controlnet,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                        )
+                    if (global_step % args.validation_steps == 0 \
+                        # add log_validation at first global step
+                        or global_step == 1 \
+                        # add log_validation at last global step
+                        or global_step == args.max_train_steps):
+                        
+                        image_logs = log_validation(
+                        vae,
+                        text_encoder,
+                        tokenizer,
+                        unet,
+                        controlnet,
+                        args,
+                        accelerator,
+                        weight_dtype,
+                        global_step,
+                        zoe_depth_model=zoe_depth_model
+                    )
 
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
