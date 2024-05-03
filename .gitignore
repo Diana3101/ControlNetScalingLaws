@@ -31,8 +31,6 @@ controlnet-scalinglaws.yaml
 download_laion.py
 inference.py
 torch_check.py
-ffcv_writer.py
-generate_test_set_fill50k.ipynb
 train_laion_controlnet_ffcv.py
 train_laion_controlnet_webdataset_backup.py
 validate_laion_controlnet_backup.py
