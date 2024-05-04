@@ -18,3 +18,4 @@ dependencies:
     - datasets
     - kornia==0.7.0
     - bitsandbytes
+    - timm==0.6.7

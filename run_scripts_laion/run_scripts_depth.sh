@@ -5,7 +5,7 @@ accelerate launch train_laion_controlnet_webdataset.py \
  --dataset_length=1000 \
  --download_dataset_before_streaming \
  --cache_dir="/shared_drive/user-files/huggingface/datasets/cache" \
- --output_dir="/mnt/disks/disk_1tb/checkpoints_laion/laion1k-depth-10ksteps" \
+ --output_dir="/mnt/disks/disk_1tb/checkpoints_laion/laion1k-depth-16ksteps" \
  --dataloader_num_workers=1 \
  --mixed_precision="bf16" \
  --resolution=512 \
@@ -23,9 +23,6 @@ accelerate launch train_laion_controlnet_webdataset.py \
  --lr_warmup_steps=4000 \
  --checkpointing_steps=500 \
  --seed=0 \
- --num_train_epochs=5000 \
+ --num_train_epochs=8000 \
  --report_to=wandb \
  --tracker_project_name='laion_train_controlnet_MAIN'
-
-#  --multi_gpu
-# --gradient_accumulation_steps=16/8 \
