@@ -310,9 +310,6 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
 
     with torch.inference_mode():
         for n_batch, batch in tqdm(enumerate(valid_dataloader)):
-            ### DEBUG
-            if n_batch > 1:
-                break
             # logger.info(f"Start batch calculations ...")
             image_idxs_to_save_batch_map = {}
             image_idxs_to_save_batch = []
