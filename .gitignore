@@ -9,7 +9,6 @@ laion_1M_subset_pipeline/
 metrics/check_edges.ipynb
 metrics/tests_depth.py
 metrics/tests_edge.py
-run_scripts_laion/validation/
 run_scripts_laion/run_scripts_ffcv.sh
 test_set_creation/
 test_set_fill50k/

@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 import logging
 from torchvision import transforms
+from datasets import load_dataset
 
 import diffusers
 from diffusers import (
@@ -144,20 +145,12 @@ def get_controlnet_loss(pixel_values, conditioning_pixel_values, input_ids, vae,
     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
     return loss.detach().item()
 
-class ValidationDataset(torch.utils.data.Dataset):
+class ValidationDatasetManual(torch.utils.data.Dataset):
     def __init__(self, validation_images_pathes, validation_prompts):
-        
         self.validation_images_pathes = validation_images_pathes
         self.validation_prompts = validation_prompts
 
-    def __len__(self):
-        return len(self.validation_images_pathes)
-
-    def __getitem__(self, idx):
-        validation_image = Image.open(self.validation_images_pathes[idx]).convert("RGB")
-        validation_target_path = self.validation_images_pathes[idx].replace(f'condition_{args.condition_type}/conditioning', 'target')
-        validation_target = Image.open(validation_target_path).convert("RGB")
-
+    def get_transformed_sample(self, validation_image, validation_target, prompt):
         image_transforms = transforms.Compose(
                 [
                     transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -182,10 +175,66 @@ class ValidationDataset(torch.utils.data.Dataset):
         validation_image_tensor = transforms.ToTensor()(validation_image)
         
         sample = {'pixel_values': pixel_values, 'conditioning_pixel_values': conditioning_pixel_values,
-                    'prompt': self.validation_prompts[idx],
+                    'prompt': prompt,
                     'validation_target_tensor': validation_target_tensor, 
                     'validation_image_tensor': validation_image_tensor}
         return sample
+
+    def __len__(self):
+        return len(self.validation_images_pathes)
+
+    def __getitem__(self, idx):
+        validation_image = Image.open(self.validation_images_pathes[idx]).convert("RGB")
+        validation_target_path = self.validation_images_pathes[idx].replace(f'condition_{args.condition_type}/conditioning', 'target')
+        validation_target = Image.open(validation_target_path).convert("RGB")
+        prompt = self.validation_prompts[idx]
+
+        return self.get_transformed_sample(validation_image=validation_image, 
+                                           validation_target=validation_target, 
+                                           prompt=prompt)
+
+
+def make_valid_dataset(args):
+    dataset = load_dataset(args.test_set_name, split='test',
+                    cache_dir=args.cache_dir)
+        
+    def preprocess_test(examples, condition_type):
+        target_images = [image.convert("RGB") for image in examples['target_image']]
+        validation_images = [image.convert("RGB") for image in examples[f'conditioning_image_{condition_type}']]
+        validation_prompts = examples['prompt']
+
+        image_transforms = transforms.Compose(
+                [
+                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                    transforms.CenterCrop(args.resolution),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5], [0.5]),
+                ]
+            )
+    
+        condition_image_transforms = transforms.Compose(
+                [
+                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                    transforms.CenterCrop(args.resolution),
+                    transforms.ToTensor(),
+                ]
+            )
+
+        pixel_values = [image_transforms(image) for image in target_images]
+        conditioning_pixel_values = [condition_image_transforms(image) for image in validation_images]
+
+        validation_target_tensors = [transforms.ToTensor()(image) for image in target_images]
+        validation_image_tensors = [transforms.ToTensor()(image) for image in validation_images]
+
+        sample = {'pixel_values': pixel_values, 'conditioning_pixel_values': conditioning_pixel_values,
+                    'prompt': validation_prompts,
+                    'validation_target_tensor': validation_target_tensors, 
+                    'validation_image_tensor': validation_image_tensors}
+        return sample
+    
+    validation_dataset = dataset.with_transform(lambda x: preprocess_test(x, args.condition_type))
+    return validation_dataset
+        
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_dtype, zoe_depth_model, device, checkpoint_step,
                    noise_scheduler, image_idxs_wandb, image_idxs_to_save, checkpoint_path):
@@ -204,7 +253,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(device)
-    pipeline.set_progress_bar_config(disable=False)
+    # pipeline.set_progress_bar_config(disable=False)
+    pipeline.set_progress_bar_config(disable=True)
 
     pipeline.enable_vae_slicing()
 
@@ -212,20 +262,17 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
         generator = None
     else:
         generator = torch.Generator(device=device).manual_seed(args.seed)
+    
+    wandb_logs = []
 
-    if args.validation_set_folder:
-        df_prompts = pd.read_csv(f'{args.validation_set_folder}/prompts.csv')
-        validation_prompts = list(df_prompts['text'])
+    if args.condition_type == 'canny':
+        val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
+    elif args.condition_type == 'depth':
+        val_avg_metrics_dict = dict(a1=[], a2=[], a3=[], abs_rel=[], 
+                                    rmse=[], log_10=[], rmse_log=[], silog=[], sq_rel=[])
 
-        validation_images = os.listdir(f'{args.validation_set_folder}/condition_{args.condition_type}/')
-        validation_images = [f"{args.validation_set_folder}/condition_{args.condition_type}/{file}" for file in validation_images if 'conditioning_image' in file]
-
-        validation_images = sorted(validation_images, key=sort_by_number)
-
-        # ### TEST
-        validation_prompts = validation_prompts[:120]
-        validation_images = validation_images[:120]
-
+    if args.test_set_name:
+        valid_dataset = make_valid_dataset(args)
     else:
         if len(args.validation_image) == len(args.validation_prompt):
             validation_images = args.validation_image
@@ -240,24 +287,17 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
             raise ValueError(
                 "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
             )
-
+        
+        valid_dataset = ValidationDatasetManual(validation_images_pathes=validation_images,
+                                        validation_prompts=validation_prompts)
     
-    wandb_logs = []
 
-    if args.condition_type == 'canny':
-        val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
-    elif args.condition_type == 'depth':
-        val_avg_metrics_dict = dict(a1=[], a2=[], a3=[], abs_rel=[], 
-                                    rmse=[], log_10=[], rmse_log=[], silog=[], sq_rel=[])
-
-
-    valid_dataset = ValidationDataset(validation_images_pathes=validation_images,
-                                      validation_prompts=validation_prompts)
-    
     valid_dataloader = torch.utils.data.DataLoader(valid_dataset, 
                                         batch_size=args.batch_size, 
                                         num_workers=args.num_workers,
                                         pin_memory=True)
+    
+    # logger.info(f"Dataloader created")
     
     batch_losses = []
     formatted_images = []
@@ -270,6 +310,10 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
 
     with torch.inference_mode():
         for n_batch, batch in tqdm(enumerate(valid_dataloader)):
+            ### DEBUG
+            if n_batch > 1:
+                break
+            # logger.info(f"Start batch calculations ...")
             image_idxs_to_save_batch_map = {}
             image_idxs_to_save_batch = []
             for x in image_idxs_to_save:
@@ -290,9 +334,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                 del conditioning_pixel_values
                 del input_ids
                 torch.cuda.empty_cache()
-
-            print('Loss calculated')
                 
+            # logger.info(f"Loss calculated")
             batch_losses.append(loss)
 
             validation_target_tensors = batch['validation_target_tensor'].to(device=device, dtype=weight_dtype, non_blocking=True)
@@ -305,7 +348,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                 )[0]
                 torch.cuda.empty_cache()
 
-
+            # logger.info(f"Batch predicted")
             pred_batch_images = torch.from_numpy(pred_batch_images).to(device=device, dtype=weight_dtype, non_blocking=True)
             pred_batch_images = pred_batch_images.permute(0, 3, 1, 2)
             
@@ -322,6 +365,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                 pred_batch_images_edges, pred_batch_images_edges_blured,
                 validation_image_tensors_blured) = get_edge_metrics(pred_batch_images=pred_batch_images, 
                                                                 validation_image_tensors=validation_image_tensors)
+                
+                # logger.info(f"Metrics calculated")
 
                 val_avg_img_ods.append(avg_img_ods)
                 val_avg_img_ap.append(avg_img_ap)
@@ -376,11 +421,20 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
 
                         formatted_images.append(wandb.Image(pred_img_pil, caption=prompts[idx]))
 
+                del pred_batch_images_edges_small
+                del validation_image_tensors_blured_small
+                del pred_batch_images_edges_blured_small
+                del pred_batch_images_small
+                del validation_images
+                del validation_targets
+                torch.cuda.empty_cache()
 
             elif args.condition_type == 'depth':
                 avg_metrics_dict, pred_depth_images = get_depth_metrics(pred_batch_images=pred_batch_images, 
                                                                     validation_target_tensors=validation_target_tensors,
                                                                     zoe_depth_model=zoe_depth_model)
+                
+                # logger.info(f"Metrics calculated")
                 
                 for key, value in avg_metrics_dict.items():
                     val_avg_metrics_dict[key].append(value)
@@ -424,8 +478,11 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
 
                         formatted_images.append(wandb.Image(pred_img_pil, caption=prompts[idx]))
 
-                        
-
+                del pred_batch_images_small
+                del pred_depth_images_small
+                del validation_images
+                del validation_targets
+                torch.cuda.empty_cache()
 
     if args.condition_type == 'canny':
         wandb_logs.append({
@@ -438,14 +495,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
         
     elif args.condition_type == 'depth':
         wandb_logs_dict_to_append = {f"validation": formatted_images, "loss": np.mean(batch_losses)}
-        import pdb; pdb.set_trace()
         for key, metrics_list in val_avg_metrics_dict.items():
             wandb_logs_dict_to_append[f"depth_metric/{key}"] = np.mean(metrics_list)
 
         wandb_logs.append(wandb_logs_dict_to_append)
 
     wandb_logs = {key: value for d in wandb_logs for key, value in d.items()}
-    # wandb.log(wandb_logs, step=checkpoint_step)
+    wandb.log(wandb_logs, step=checkpoint_step)
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -512,9 +568,10 @@ def parse_args(input_args=None):
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
 
     parser.add_argument(
-        "--validation_set_folder",
+        "--test_set_name",
         type=str,
-        default=None
+        default=None,
+        help = "Name of the test dataset on the HuggingFace"
     )
 
     parser.add_argument(
@@ -605,6 +662,21 @@ def parse_args(input_args=None):
         "--predicted_images_dir",
         type=str,
         required=True,
+        help="dir to save predicted images.",
+    )
+
+    parser.add_argument(
+        "--wandb_project_name",
+        type=str,
+        default='validate_controlnet',
+        required=True
+    )
+
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
     )
 
     args = parser.parse_args()
@@ -662,10 +734,10 @@ def main(args):
 
     tracker_config = dict(vars(args))
 
-    # run = wandb.init(
-    #         project=args.tracker_project_name,
-    #         config=tracker_config
-    #     )
+    run = wandb.init(
+        project=args.wandb_project_name,
+        config=tracker_config
+    )
     
     image_idxs_to_save = [1,3,4,5,11,12,17,22,23,25,28,30,31,36,37,40,43,46,47,69] + list(range(250, 300)) + list(range(500, 530))
     image_idxs_wandb = [17,23,25,28,30]
@@ -685,19 +757,18 @@ def main(args):
         folders_with_checkpoints = sorted(folders_with_checkpoints, key=sort_by_number)
 
         for folder in folders_with_checkpoints:
-            # controlnet_path = os.path.join(controlnet_checkpoints_folder, folder, 'controlnet')
-            # controlnet_pathes.append(controlnet_path)
+            controlnet_path = os.path.join(controlnet_checkpoints_folder, folder, 'controlnet')
+            controlnet_pathes.append(controlnet_path)
 
-            ### CUSTOM
-            if '8.5epochs' in controlnet_checkpoints_folder:
-                controlnet_path = os.path.join(controlnet_checkpoints_folder, folder, 'controlnet')
-                checkpoint_step = int(controlnet_path.split('/')[-2].split('-')[-1])
-                if checkpoint_step < 6045:
-                    controlnet_pathes.append(controlnet_path)
-            else:
-                controlnet_path = os.path.join(controlnet_checkpoints_folder, folder, 'controlnet')
-                controlnet_pathes.append(controlnet_path)
-
+            # ### CUSTOM
+            # if '8.5epochs' in controlnet_checkpoints_folder:
+            #     controlnet_path = os.path.join(controlnet_checkpoints_folder, folder, 'controlnet')
+            #     checkpoint_step = int(controlnet_path.split('/')[-2].split('-')[-1])
+            #     if checkpoint_step < 6045:
+            #         controlnet_pathes.append(controlnet_path)
+            # else:
+            #     controlnet_path = os.path.join(controlnet_checkpoints_folder, folder, 'controlnet')
+            #     controlnet_pathes.append(controlnet_path)
 
         return controlnet_pathes
     
@@ -710,6 +781,10 @@ def main(args):
 
         for controlnet_path in tqdm(all_controlnet_pathes):
             checkpoint_step = int(controlnet_path.split('/')[-2].split('-')[-1])
+
+            if checkpoint_step % 1000 != 0:
+                continue
+
             train_folder = controlnet_path.split('/')[-3]
             checkpoint_folder = controlnet_path.split('/')[-2]
 
@@ -781,7 +856,7 @@ def main(args):
     else:
         logger.info("You have to give `controlnet_checkpoints_folders` OR `controlnet_checkpoint_path`!")
 
-    # wandb.finish()
+    wandb.finish()
 
 
 if __name__ == "__main__":

@@ -133,7 +133,7 @@ def colorize_batched(value, vmin=None, vmax=None,invalid_val=-99, invalid_mask=N
         img = torch.power(img, 2.2)
         img = img * 255
         img = img.byte()#.astype(np.uint8)
-    return 255 - img.detach().cpu().numpy()
+    return 255 - img
 
 
 def get_depth_metrics(pred_batch_images, validation_target_tensors, zoe_depth_model):
@@ -159,5 +159,9 @@ def get_depth_metrics(pred_batch_images, validation_target_tensors, zoe_depth_mo
 
     for key, value in avg_metrics_dict.items():
         avg_metrics_dict[key] = value / pred_depthes.shape[0]
+
+    del gt_depthes
+    del pred_depthes
+    torch.cuda.empty_cache()
 
     return avg_metrics_dict, pred_depth_images

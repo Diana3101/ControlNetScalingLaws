@@ -7,7 +7,6 @@ dependencies:
   - cuda-nvcc
   - pytorch
   - torchvision
-  - torchaudio
   - pytorch::pytorch-cuda=12.1
   - pip:
     - diffusers==0.26.3
