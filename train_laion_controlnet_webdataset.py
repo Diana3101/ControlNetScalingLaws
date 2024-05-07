@@ -761,7 +761,7 @@ def make_train_dataset(args, tokenizer):
                 num_proc=args.dataloader_num_workers,
                 cache_dir=args.cache_dir)
             
-            iterable_dataset = dataset.to_iterable_dataset()
+            iterable_dataset = dataset.to_iterable_dataset(num_shards=args.dataloader_num_workers)
 
         else:
             iterable_dataset = load_dataset(
@@ -1311,6 +1311,8 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+
+        logger.info(f'End of epoch: {epoch}')
 
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
