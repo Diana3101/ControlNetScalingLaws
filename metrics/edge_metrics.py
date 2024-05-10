@@ -3,12 +3,7 @@
 """
 
 import numpy as np
-import pandas as pd
-import os
-import csv
-import argparse
-from tqdm import tqdm
-from PIL import Image    
+import pandas as pd   
     
     
 def get_ods_ap(img_pred, img_true, is_uint8, step=0.01):
@@ -22,7 +17,8 @@ def get_ods_ap(img_pred, img_true, is_uint8, step=0.01):
     thres = 0.0
     list_pred = []
     list_and = []
-    num_true = [np.sum(img_true)]
+    num_true = np.sum(img_true)
+
     while thres < 1.0:
         img_thred = (img_pred > thres).astype(np.int32)
         num_pred = np.sum(img_thred) 
@@ -36,33 +32,31 @@ def get_ods_ap(img_pred, img_true, is_uint8, step=0.01):
         list_and.append(num_and)
         thres += step
 
-    df_pred = pd.DataFrame(list_pred).T
-    df_true = pd.DataFrame([num_true])
-    df_and = pd.DataFrame(list_and).T
     
-    if not len(df_pred) == len(df_true) == len(df_and):
-        print("Different rows")
-        return 
-    n_cols = len(df_pred.columns)
+    n_cols = len(list_pred)
     f_best = 0.0
     sum_precision = 0.0
+
     for i in range(n_cols):
-        try:
+        if list_pred[i] != 0:
             ######### 788 - count of same 1.0 in pred and true / 2574 - count of 1.0 in pred image = 0.3
             # precision - count of correctly predicted from all predicted
-            precision = int(np.sum(df_and.iloc[:,i])) / int(np.sum(df_pred.iloc[:,i]))
-            recall = np.sum(df_and.iloc[:,i]) / np.sum(df_true.iloc[:])
+            precision = list_and[i] / list_pred[i]
+            recall = list_and[i] / num_true
 
-            f = float(2*precision*recall / (recall + precision))
-
+            if precision == 0 and recall == 0:
+                f = 0.0
+            else:
+                f = float(2*precision*recall / (recall + precision))
+            
             sum_precision += precision
-        except ZeroDivisionError:
+        else:
+            sum_precision += 0.0
             f = 0.0
         if f > f_best:
             f_best = f
         
-    ois = f_best
     ap = sum_precision / n_cols
-    # from source code
-    ods = ois
+    ods = f_best
+
     return ods, ap

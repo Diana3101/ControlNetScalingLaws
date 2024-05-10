@@ -185,7 +185,10 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
         validation_image = Image.open(validation_image_init).convert("RGB")
 
-        validation_target = validation_image_init.replace('conditioning', 'target')
+        if args.condition_type == 'canny':
+            validation_target = validation_image_init.replace('conditioning', 'target').replace('.png', '.jpg')
+        elif args.condition_type == 'depth':
+            validation_target = validation_image_init.replace('conditioning', 'target')
         validation_target = Image.open(validation_target).convert("RGB")
                 
         images = []
@@ -201,8 +204,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         if args.condition_type == 'canny':
             avg_img_ods, avg_img_ap, \
             avg_img_ods_blur, avg_img_ap_blur, \
-            last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metrics(pred_images=images, 
-                                                                                            condition_img=validation_image)
+            last_image_edge, last_image_edge_blur = get_edge_metrics(pred_images=images, 
+                                                                     condition_img=validation_image)
 
             val_avg_img_ods.append(avg_img_ods)
             val_avg_img_ap.append(avg_img_ap)
@@ -213,7 +216,6 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
             image_logs.append(
                 {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
                 "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
-                "validation_image_blur": validation_image_blur,
                 "target_image": validation_target}
             )
 
@@ -240,15 +242,11 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                     validation_prompt = log["validation_prompt"]
                     validation_image = log["validation_image"]
                     target_image = log["target_image"]
-                    validation_image_blur = log["validation_image_blur"]
                     last_image_edge = log["last_image_edge"]
                     last_image_edge_blur = log["last_image_edge_blur"]
 
                     formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
                     formatted_images.append(wandb.Image(last_image_edge, caption="Prediction image: Canny edge"))
-
-                        
-                    formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
                     formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
                     formatted_images.append(wandb.Image(target_image, caption="Target"))
 
@@ -1039,7 +1037,7 @@ def main(args):
     
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(((args.dataset_length/args.train_batch_size) / args.gradient_accumulation_steps) / accelerator.num_processes)
+    num_update_steps_per_epoch = math.ceil((args.dataset_length/args.train_batch_size) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -1082,7 +1080,7 @@ def main(args):
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(((args.dataset_length/args.train_batch_size) / args.gradient_accumulation_steps) / accelerator.num_processes)
+    num_update_steps_per_epoch = math.ceil((args.dataset_length/args.train_batch_size) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -1104,8 +1102,7 @@ def main(args):
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {(args.dataset_length/args.train_batch_size)*args.train_batch_size}")
-    # logger.info(f"  Num batches each epoch = {args.dataset_length/args.train_batch_size}")
-    logger.info(f"  Num batches each epoch = {args.dataset_length/total_batch_size}")
+    logger.info(f"  Num batches each epoch = {args.dataset_length/args.train_batch_size}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -1234,16 +1231,16 @@ def main(args):
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                #if args.report_to == "wandb" and is_wandb_available():
-                #    # threshold = 0.1
-                #    detached_loss = loss.cpu().detach().numpy()
-                #    if detached_loss > 0.5 and args.wandb_alerts_counter == 0:
-                #        wandb.alert(
-                #                title="High loss (> 0.5)",
-                #                text=f"Loss: {detached_loss}",
-                #                level=AlertLevel.WARN,
-                #            )
-                #        args.wandb_alerts_counter += 1
+                # if args.report_to == "wandb" and is_wandb_available():
+                #     # threshold = 0.1
+                #     detached_loss = loss.cpu().detach().numpy()
+                #     if detached_loss > 0.5 and args.wandb_alerts_counter == 0:
+                #         wandb.alert(
+                #                 title="High loss (> 0.5)",
+                #                 text=f"Loss: {detached_loss}",
+                #                 level=AlertLevel.WARN,
+                #             )
+                #         args.wandb_alerts_counter += 1
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

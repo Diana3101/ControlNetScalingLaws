@@ -7,8 +7,8 @@ checkpoints_laion/
 detr_object_detection/
 laion_1M_subset_pipeline/
 metrics/check_edges.ipynb
-metrics/tests_depth.py
-metrics/tests_edge.py
+metrics/test_depth.py
+metrics/test_edge.py
 run_scripts_laion/run_scripts_ffcv.sh
 test_set_creation/
 test_set_fill50k/

@@ -12,6 +12,7 @@ def get_edge_metrics(pred_images, condition_img):
     t_lower = 100  # Lower Threshold 
     t_upper = 200  # Upper threshold 
     condition_img = np.array(condition_img.convert("L"))
+    assert np.unique(condition_img)[0] == 0 and np.unique(condition_img)[1] == 255, "Condition edge image should have only 0 and 255 values"
 
     avg_img_ap = 0
     avg_img_ods = 0
@@ -19,15 +20,13 @@ def get_edge_metrics(pred_images, condition_img):
     avg_img_ap_blur = 0
     avg_img_ods_blur = 0
 
-    condition_img_blur = cv2.blur(condition_img,(5,5))
-
     for pred_image in pred_images:
         pred_image = np.array(pred_image)
         pred_image_edge = cv2.Canny(pred_image, t_lower, t_upper)
         pred_image_edge_blur = cv2.blur(pred_image_edge,(5,5))
 
         ods, ap = get_ods_ap(img_pred=pred_image_edge, img_true=condition_img, is_uint8=True)
-        ods_blur, ap_blur = get_ods_ap(img_pred=pred_image_edge_blur, img_true=condition_img_blur, is_uint8=True)
+        ods_blur, ap_blur = get_ods_ap(img_pred=pred_image_edge_blur, img_true=condition_img, is_uint8=True)
 
         avg_img_ap += ap
         avg_img_ods += ods
@@ -46,7 +45,7 @@ def get_edge_metrics(pred_images, condition_img):
 
     return  avg_img_ods, avg_img_ap, \
             avg_img_ods_blur, avg_img_ap_blur, \
-            last_pred_image_edge, last_pred_image_edge_blur, condition_img_blur
+            last_pred_image_edge, last_pred_image_edge_blur
 
 
 def torch_percentile(t: torch.tensor, q: float, dim=-1) -> Union[int, float]:

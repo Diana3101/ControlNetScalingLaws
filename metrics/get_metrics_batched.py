@@ -17,10 +17,6 @@ def get_edge_metrics(pred_batch_images, validation_image_tensors):
 
         # pil_edge = transforms.functional.to_pil_image(pred_batch_images_edges[0].squeeze())
         # pil_edge.save('kornia_edge_0.jpg')
-       
-        validation_image_tensors_blured = box_blur(validation_image_tensors, kernel_size=(5,5))
-        # pil_blur = transforms.functional.to_pil_image(validation_image_tensors_blured[0].squeeze())
-        # pil_blur.save('kornia_blur_0.jpg')
 
     avg_img_ap = 0
     avg_img_ods = 0
@@ -33,10 +29,10 @@ def get_edge_metrics(pred_batch_images, validation_image_tensors):
         condition_img  = validation_image_tensors[i].cpu().numpy()
 
         pred_image_edge_blur = pred_batch_images_edges_blured[i].squeeze().cpu().numpy()
-        condition_img_blur = validation_image_tensors_blured[i].cpu().numpy()
-
+        
+        assert np.unique(condition_img)[0] == 0 and np.unique(condition_img)[1] == 1, "Condition edge image should have only 0 and 1 values"
         ods, ap = get_ods_ap(img_pred=pred_image_edge, img_true=condition_img, is_uint8=False)
-        ods_blur, ap_blur = get_ods_ap(img_pred=pred_image_edge_blur, img_true=condition_img_blur, is_uint8=False)
+        ods_blur, ap_blur = get_ods_ap(img_pred=pred_image_edge_blur, img_true=condition_img, is_uint8=False)
 
         avg_img_ap += ap
         avg_img_ods += ods
@@ -52,7 +48,7 @@ def get_edge_metrics(pred_batch_images, validation_image_tensors):
 
     return  avg_img_ods, avg_img_ap, \
             avg_img_ods_blur, avg_img_ap_blur, \
-            pred_batch_images_edges, pred_batch_images_edges_blured, validation_image_tensors_blured
+            pred_batch_images_edges, pred_batch_images_edges_blured
 
 
 def torch_percentile(t: torch.tensor, q: float, dim=-1) -> Union[int, float]:

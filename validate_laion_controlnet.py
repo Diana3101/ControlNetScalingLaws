@@ -83,14 +83,16 @@ def init_zoe_model(device, dtype):
     return model_zoe_n
 
 def sort_by_number(file_name):
-        if '.jpg' in file_name:
-            match = re.search(r'(\d+)(?=\.jpg)', file_name)
-        else:
-            match = re.search(r'\d+', file_name)  # Find the first number in the file name
-        if match:
-            return int(match.group())  # Convert the matched number to an integer
-        else:
-            return float('inf')  # If no number found, place the file at the end of the list
+    if '.jpg' in file_name:
+        match = re.search(r'(\d+)(?=\.jpg)', file_name)
+    elif '.png' in file_name:
+        match = re.search(r'(\d+)(?=\.png)', file_name)
+    else:
+        match = re.search(r'\d+', file_name)  # Find the first number in the file name
+    if match:
+        return int(match.group())  # Convert the matched number to an integer
+    else:
+        return float('inf')  # If no number found, place the file at the end of the list
 
 
 def get_controlnet_loss(pixel_values, conditioning_pixel_values, input_ids, vae, noise_scheduler,
@@ -310,6 +312,9 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
 
     with torch.inference_mode():
         for n_batch, batch in tqdm(enumerate(valid_dataloader)):
+            # ### TEST
+            # if n_batch > 1:
+            #     break
             # logger.info(f"Start batch calculations ...")
             image_idxs_to_save_batch_map = {}
             image_idxs_to_save_batch = []
@@ -359,8 +364,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
 
                 (avg_img_ods, avg_img_ap,
                 avg_img_ods_blur, avg_img_ap_blur,
-                pred_batch_images_edges, pred_batch_images_edges_blured,
-                validation_image_tensors_blured) = get_edge_metrics(pred_batch_images=pred_batch_images, 
+                pred_batch_images_edges, pred_batch_images_edges_blured) = get_edge_metrics(pred_batch_images=pred_batch_images, 
                                                                 validation_image_tensors=validation_image_tensors)
                 
                 # logger.info(f"Metrics calculated")
@@ -383,9 +387,6 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                 pred_batch_images_edges_blured_small = pred_batch_images_edges_blured[image_idxs_to_save_batch].clone()
                 del pred_batch_images_edges_blured
 
-                validation_image_tensors_blured_small = validation_image_tensors_blured[image_idxs_to_save_batch].clone()
-                del validation_image_tensors_blured
-
                 validation_targets = validation_target_tensors[image_idxs_to_save_batch].clone()
                 del validation_target_tensors
 
@@ -394,16 +395,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                 for idx in range(len(image_idxs_to_save_batch)):
                     original_idx = image_idxs_to_save_batch_map[image_idxs_to_save_batch[idx]]
                     pred_edges_pil = transforms.functional.to_pil_image(pred_batch_images_edges_small[idx])
-                    pred_edges_pil.save(f"{checkpoint_path}/predicted_edges_{original_idx}.jpg")
-
-                    val_img_blur_pil = transforms.functional.to_pil_image(validation_image_tensors_blured_small[idx])
-                    val_img_blur_pil.save(f"{checkpoint_path}/conditioning_image_blur_{original_idx}.jpg")
+                    pred_edges_pil.save(f"{checkpoint_path}/predicted_edges_{original_idx}.png")
 
                     pred_edges_blur_pil = transforms.functional.to_pil_image(pred_batch_images_edges_blured_small[idx])
-                    pred_edges_blur_pil.save(f"{checkpoint_path}/predicted_edges_blur_{original_idx}.jpg")
+                    pred_edges_blur_pil.save(f"{checkpoint_path}/predicted_edges_blur_{original_idx}.png")
 
                     pred_img_pil = transforms.functional.to_pil_image(pred_batch_images_small[idx])
-                    pred_img_pil.save(f"{checkpoint_path}/predicted_image_{original_idx}.jpg")
+                    pred_img_pil.save(f"{checkpoint_path}/predicted_image_{original_idx}.png")
 
 
                     if original_idx in image_idxs_wandb:
@@ -412,14 +410,12 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                         formatted_images.append(wandb.Image(val_img_pil, caption="Controlnet conditioning"))
                         formatted_images.append(wandb.Image(pred_edges_pil, caption="Prediction image: Canny edge"))
 
-                        formatted_images.append(wandb.Image(val_img_blur_pil, caption="Controlnet conditioning BLUR"))
                         formatted_images.append(wandb.Image(pred_edges_blur_pil, caption="Prediction image: Canny edge BLUR"))
                         formatted_images.append(wandb.Image(target_pil, caption="Target"))
 
                         formatted_images.append(wandb.Image(pred_img_pil, caption=prompts[idx]))
 
                 del pred_batch_images_edges_small
-                del validation_image_tensors_blured_small
                 del pred_batch_images_edges_blured_small
                 del pred_batch_images_small
                 del validation_images
@@ -829,7 +825,7 @@ def main(args):
                 
         checkpoint_path = os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder)
         logger.info(f"Loading existing controlnet weights for checkpoint step {checkpoint_step}")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path, 
+        controlnet = ControlNetModel.from_pretrained(args.controlnet_checkpoint_path, 
                                                      torch_dtype=weight_dtype, 
                                                      use_safetensors=True)
         controlnet = controlnet.to(device)
