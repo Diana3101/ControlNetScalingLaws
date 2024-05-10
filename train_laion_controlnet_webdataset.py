@@ -1234,16 +1234,16 @@ def main(args):
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                if args.report_to == "wandb" and is_wandb_available():
-                    # threshold = 0.1
-                    detached_loss = loss.cpu().detach().numpy()
-                    if detached_loss > 0.5 and args.wandb_alerts_counter == 0:
-                        wandb.alert(
-                                title="High loss (> 0.5)",
-                                text=f"Loss: {detached_loss}",
-                                level=AlertLevel.WARN,
-                            )
-                        args.wandb_alerts_counter += 1
+                #if args.report_to == "wandb" and is_wandb_available():
+                #    # threshold = 0.1
+                #    detached_loss = loss.cpu().detach().numpy()
+                #    if detached_loss > 0.5 and args.wandb_alerts_counter == 0:
+                #        wandb.alert(
+                #                title="High loss (> 0.5)",
+                #                text=f"Loss: {detached_loss}",
+                #                level=AlertLevel.WARN,
+                #            )
+                #        args.wandb_alerts_counter += 1
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
