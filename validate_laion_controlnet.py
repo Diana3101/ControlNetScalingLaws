@@ -239,7 +239,7 @@ def make_valid_dataset(args):
         
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_dtype, zoe_depth_model, device, checkpoint_step,
-                   noise_scheduler, image_idxs_wandb, image_idxs_to_save, checkpoint_path):
+                   noise_scheduler, image_idxs_wandb, image_idxs_to_save, checkpoint_path, train_folder=None):
     logger.info("Running validation... ")
 
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
@@ -478,18 +478,33 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, weight_
                 torch.cuda.empty_cache()
 
     if args.condition_type == 'canny':
-        wandb_logs.append({
-                            f"validation": formatted_images,
-                            "loss": np.mean(batch_losses),
-                            f"edge_metric/ODS": np.mean(val_avg_img_ods),
-                            f"edge_metric/AP": np.mean(val_avg_img_ap),
-                            f"edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
-                            f"edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
+        if train_folder:
+            wandb_logs.append({
+                                f"{train_folder}_validation": formatted_images,
+                                f"{train_folder}_loss": np.mean(batch_losses),
+                                f"{train_folder}_edge_metric/ODS": np.mean(val_avg_img_ods),
+                                f"{train_folder}_edge_metric/AP": np.mean(val_avg_img_ap),
+                                f"{train_folder}_edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
+                                f"{train_folder}_edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
+        else:
+            wandb_logs.append({
+                                f"validation": formatted_images,
+                                "loss": np.mean(batch_losses),
+                                f"edge_metric/ODS": np.mean(val_avg_img_ods),
+                                f"edge_metric/AP": np.mean(val_avg_img_ap),
+                                f"edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
+                                f"edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
         
     elif args.condition_type == 'depth':
-        wandb_logs_dict_to_append = {f"validation": formatted_images, "loss": np.mean(batch_losses)}
-        for key, metrics_list in val_avg_metrics_dict.items():
-            wandb_logs_dict_to_append[f"depth_metric/{key}"] = np.mean(metrics_list)
+        if train_folder:
+            wandb_logs_dict_to_append = {f"{train_folder}_validation": formatted_images, 
+                                         f"{train_folder}_loss": np.mean(batch_losses)}
+            for key, metrics_list in val_avg_metrics_dict.items():
+                wandb_logs_dict_to_append[f"{train_folder}_depth_metric/{key}"] = np.mean(metrics_list)
+        else:
+            wandb_logs_dict_to_append = {f"validation": formatted_images, "loss": np.mean(batch_losses)}
+            for key, metrics_list in val_avg_metrics_dict.items():
+                wandb_logs_dict_to_append[f"depth_metric/{key}"] = np.mean(metrics_list)
 
         wandb_logs.append(wandb_logs_dict_to_append)
 
@@ -535,10 +550,11 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
-        "--controlnet_checkpoint_path",
+        "--controlnet_checkpoint_pathes",
         type=str,
         default=None,
-        help="Path to the folder `controlnet` with the one controlnet checkpoint.",
+        nargs="+",
+        help="Pathes to the folders `controlnet`, where the one path - one controlnet checkpoint.",
     )
 
     parser.add_argument(
@@ -616,16 +632,6 @@ def parse_args(input_args=None):
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
             " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
-        ),
-    )
-
-    parser.add_argument(
-        "--tracker_project_name",
-        type=str,
-        required=True,
-        help=(
-            "The `project_name` argument passed to Accelerator.init_trackers for"
-            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
 
@@ -813,41 +819,43 @@ def main(args):
                     )
             
 
-    elif args.controlnet_checkpoint_path:
-        checkpoint_step = int(args.controlnet_checkpoint_path.split('/')[-2].split('-')[-1])
-        train_folder = args.controlnet_checkpoint_path.split('/')[-3]
-        checkpoint_folder = args.controlnet_checkpoint_path.split('/')[-2]
+    elif args.controlnet_checkpoint_pathes:
+        for controlnet_checkpoint_path in args.controlnet_checkpoint_pathes:
+            checkpoint_step = int(controlnet_checkpoint_path.split('/')[-2].split('-')[-1])
+            train_folder = controlnet_checkpoint_path.split('/')[-3]
+            checkpoint_folder = controlnet_checkpoint_path.split('/')[-2]
 
-        if not os.path.exists(os.path.join(args.predicted_images_dir, train_folder)):
-            os.makedirs(os.path.join(args.predicted_images_dir, train_folder))
-        if not os.path.exists(os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder)):
-            os.makedirs(os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder))
-                
-        checkpoint_path = os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder)
-        logger.info(f"Loading existing controlnet weights for checkpoint step {checkpoint_step}")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_checkpoint_path, 
-                                                     torch_dtype=weight_dtype, 
-                                                     use_safetensors=True)
-        controlnet = controlnet.to(device)
+            if not os.path.exists(os.path.join(args.predicted_images_dir, train_folder)):
+                os.makedirs(os.path.join(args.predicted_images_dir, train_folder))
+            if not os.path.exists(os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder)):
+                os.makedirs(os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder))
+                    
+            checkpoint_path = os.path.join(args.predicted_images_dir, train_folder, checkpoint_folder)
+            logger.info(f"Loading existing controlnet weights for model {train_folder} at checkpoint step {checkpoint_step}")
+            controlnet = ControlNetModel.from_pretrained(controlnet_checkpoint_path, 
+                                                        torch_dtype=weight_dtype, 
+                                                        use_safetensors=True)
+            controlnet = controlnet.to(device)
 
-        log_validation(
-                        vae,
-                        text_encoder,
-                        tokenizer,
-                        unet,
-                        controlnet,
-                        args,
-                        weight_dtype,
-                        zoe_depth_model=zoe_depth_model,
-                        device=device,
-                        checkpoint_step=checkpoint_step,
-                        noise_scheduler=noise_scheduler,
-                        image_idxs_wandb=image_idxs_wandb,
-                        image_idxs_to_save=image_idxs_to_save,
-                        checkpoint_path=checkpoint_path
-                    )
+            log_validation(
+                            vae,
+                            text_encoder,
+                            tokenizer,
+                            unet,
+                            controlnet,
+                            args,
+                            weight_dtype,
+                            zoe_depth_model=zoe_depth_model,
+                            device=device,
+                            checkpoint_step=checkpoint_step,
+                            noise_scheduler=noise_scheduler,
+                            image_idxs_wandb=image_idxs_wandb,
+                            image_idxs_to_save=image_idxs_to_save,
+                            checkpoint_path=checkpoint_path,
+                            train_folder=train_folder
+                        )
     else:
-        logger.info("You have to give `controlnet_checkpoints_folders` OR `controlnet_checkpoint_path`!")
+        logger.info("You have to give `controlnet_checkpoints_folders` OR `controlnet_checkpoint_pathes`!")
 
     wandb.finish()
 
