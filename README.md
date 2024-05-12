@@ -48,8 +48,8 @@ or
     - **OR** if you want to run validation on ALL checkpoint saved for the one training, replace the parameter `--controlnet_checkpoint_pathes` with `--controlnet_checkpoints_folders` and assign the value like this "/mnt/disks/disk_1tb/checkpoints_laion/laion1k-depth"
     - `--cache_dir` to the path on your instance
     - `--predicted_images_dir` to the path on your instance, where the predicted images will be saved.
-    - `--batch_size` if you need:
-        CANNY validation need 20GB GPU with batch_size=60
+    - `--batch_size` if you need:\
+        CANNY validation need 20GB GPU with batch_size=60\
         DEPTH validation need 40GB with batch_size=60
 
 - run the following command from the root folder (ControlNetScalinglaws):
