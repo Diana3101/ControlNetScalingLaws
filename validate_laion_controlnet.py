@@ -678,13 +678,26 @@ def parse_args(input_args=None):
         help="The directory where the downloaded models and datasets will be stored.",
     )
 
+    parser.add_argument(
+        "--n_cuda",
+        type=int,
+        default=0,
+        help="Number of cuda if you have multiple.",
+    )
+    
+    parser.add_argument(
+        "--use_initial_model",
+        action="store_true",
+        help="Use non-trained controlnet (step 0).",
+    )
+
     args = parser.parse_args()
 
     return args
 
 
 def main(args):
-    device = torch.device('cuda')
+    device = torch.device(f'cuda:{args.n_cuda}')
     # Load the tokenizer
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
@@ -781,7 +794,7 @@ def main(args):
         for controlnet_path in tqdm(all_controlnet_pathes):
             checkpoint_step = int(controlnet_path.split('/')[-2].split('-')[-1])
 
-            if checkpoint_step % 1000 != 0:
+            if checkpoint_step < 15000 and checkpoint_step % 1000 != 0:
                 continue
 
             train_folder = controlnet_path.split('/')[-3]
@@ -854,6 +867,33 @@ def main(args):
                             checkpoint_path=checkpoint_path,
                             train_folder=train_folder
                         )
+
+    elif args.use_initial_model:
+        logger.info("Initializing controlnet weights from unet")
+        controlnet = ControlNetModel.from_unet(unet, conditioning_channels=3)
+        controlnet = controlnet.to(device)
+
+        checkpoint_step = 0
+        checkpoint_path = os.path.join(args.predicted_images_dir, 'checkpoint-0')
+        if not os.path.exists(checkpoint_path):
+                os.makedirs(checkpoint_path)
+
+        log_validation(
+                        vae,
+                        text_encoder,
+                        tokenizer,
+                        unet,
+                        controlnet,
+                        args,
+                        weight_dtype,
+                        zoe_depth_model=zoe_depth_model,
+                        device=device,
+                        checkpoint_step=checkpoint_step,
+                        noise_scheduler=noise_scheduler,
+                        image_idxs_wandb=image_idxs_wandb,
+                        image_idxs_to_save=image_idxs_to_save,
+                        checkpoint_path=checkpoint_path
+                    )
     else:
         logger.info("You have to give `controlnet_checkpoints_folders` OR `controlnet_checkpoint_pathes`!")
 
