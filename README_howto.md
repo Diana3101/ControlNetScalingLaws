@@ -20,7 +20,7 @@ conda activate controlnet-scalinglaws
         Length of 100k dataset: 100000\
         Length of 250k dataset: 250000\
         Length of 500k dataset: 500000\
-        Length of 1M dataset: 1000320\
+        Length of 1M dataset: 1000320
 
     - `--cache_dir` and `output_dir` to the pathes on your instance
     - `--train_batch_size` and `--gradient_accumulation_steps`\
